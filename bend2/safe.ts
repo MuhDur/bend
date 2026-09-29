@@ -111,7 +111,7 @@ type Scope = { c: Bind[]; d: number; D: number; cols: Cols;
 // its model), the defs out (an opaque one flagged), each item's kernel
 // name, the items out or going out, the ones named but not yet out, the
 // kernel names taken, why each failed item is out of
-// scope, each item's specialized parameters, each def's group, and each
+// scope, each def's group, and each
 // template instance's template and ~ arguments (its key in book.tmps)
 type Safe = {
   book: Book;
@@ -122,7 +122,6 @@ type Safe = {
   todo: Array<[Name, Cols]>;
   taken: Set<string>;
   fail: Map<string, string>;
-  spec: Map<Name, boolean[]>;
   groups: Map<Name, Group | null>;
   inst: Map<Name, [Name, HTerm[]]>;
 };
@@ -151,7 +150,7 @@ function oos(why: string): never {
 // does every def that names it, and oos says why, for each book name
 function safe_book(book: Book): { text: string; oos: Array<[Name, string]> } {
   const e: Safe = { book, mb: { ...book, tlds: Object.create(book.tlds) as Book["tlds"] }, out: [], names: new Map(), seen: new Set(),
-    todo: [], taken: new Set(), fail: new Map(), spec: new Map(), groups: new Map(),
+    todo: [], taken: new Set(), fail: new Map(), groups: new Map(),
     inst: new Map(Object.entries(book.tmps).flatMap(([k, is]) => Object.entries(is).map(([key, n]): [Name, [Name, HTerm[]]] =>
       [n, [k, key.split("\n").map((a) => B.term_higher(JSON.parse(a) as B.LTerm))]]))) };
   const roots: Array<[Name, string]> = [];
@@ -348,13 +347,8 @@ function tele_open(e: Safe, s: Scope, T: HTerm, cols: Cols, n: number): { s: Sco
 
 // whether each parameter of item k is specialized: a template's ~ one
 function spec_of(e: Safe, k: Name): boolean[] {
-  let sp = e.spec.get(k);
-  if (sp === undefined) {
-    const tld = e.book.tlds[k];
-    sp = B.tele_unbind(e.book, tld.T).doms.slice(0, tld.n).map((_, j) => tld.$ === "Def" && j < tld.x);
-    e.spec.set(k, sp);
-  }
-  return sp;
+  const tld = e.book.tlds[k];
+  return Array.from({ length: tld.n }, (_, j) => tld.$ === "Def" && j < tld.x);
 }
 
 // a specialized argument: closed, in normal form
@@ -363,7 +357,7 @@ function spec_val(e: Safe, s: Scope, x: HTerm): HTerm {
   const v = B.term_snf(e.book, subst(x, s.d, (o) => o.$ === "Var" && (o.i as number) >= 0 && (o.i as number) < s.d
     ? s.c[o.i as number]?.v ?? B.Var(o.k as Name, o.i as number) : undefined));
   if (mentions(B.term_lower(v, s.d), (i) => i >= 0 && i < s.d)) {
-    oos("a kind that depends on a run-time value");
+    oos("a template argument that depends on a run-time value");
   }
   return v;
 }
@@ -475,12 +469,6 @@ function name_tt(k: Name): string {
 
 function quant(q: Quant): Q {
   return q.$ === "None" ? 0 : q.$ === "Lone" ? 1 : 2;
-}
-
-// a Quant term's literal
-function quant_eval(e: Safe, s: Scope, t: HTerm): Q {
-  const x = spec_val(e, s, t);
-  return x.$ === "Qua" ? quant(x.q) : oos("a Quant that is not a literal");
 }
 
 // Scope
@@ -785,7 +773,8 @@ function kind(e: Safe, s: Scope, T: HTerm): Q | null {
   }
   try {
     const K = B.term_wnf(e.book, B.tele_fill(e.book, tld.T, xs, B.ctx_nil()));
-    return K.$ === "Typ" ? Math.max(1, quant_eval(e, s, K.g)) as Q : null;
+    const g = K.$ === "Typ" ? spec_val(e, s, K.g) : null;
+    return g?.$ === "Qua" ? Math.max(1, quant(g.q)) as Q : null;
   } catch {
     return null;
   }
@@ -873,9 +862,8 @@ function term(e: Safe, s0: Scope, t: HTerm, live: boolean): O {
   }
 }
 
-// a head applied to its arguments: a def at the literals of its Quant
-// arguments, a template at bend2's instance, a variable, or an annotated
-// term
+// a head applied to its arguments: a def, a template at bend2's instance,
+// a variable, or an annotated term
 function spine(e: Safe, s: Scope, t: HTerm, live: boolean): O {
   const [h, xs] = unapply(t);
   const [f, T] = open(h);
