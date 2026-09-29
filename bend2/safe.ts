@@ -109,8 +109,9 @@ type Scope = { c: Bind[]; d: number; D: number; cols: Cols;
 // its model), the defs out (an opaque one flagged), each item's kernel
 // name, the items out or going out, the ones named but not yet out, the
 // kernel names taken, why each failed item is out of
-// scope, each item's specialized parameters, each def's group, and each
-// template instance's template and ~ arguments (its key in book.tmps)
+// scope, each item's specialized parameters, each def's group, each
+// template instance's template and ~ arguments (its key in book.tmps),
+// and the datatypes each root constant was split from
 type Safe = {
   book: Book;
   mb: Book;
@@ -123,6 +124,7 @@ type Safe = {
   spec: Map<Name, boolean[]>;
   groups: Map<Name, Group | null>;
   inst: Map<Name, [Name, HTerm[]]>;
+  up: Map<Name, Name[]>;
 };
 
 // Constants
@@ -134,11 +136,15 @@ const NAT_MAX = 4096;
 // Errors
 // ======
 
-// a book the kernel cannot express
-class Scope_Error extends Error {}
+// a book the kernel cannot express, and the term stuck on a root constant
+class Scope_Error extends Error {
+  constructor(why: string, readonly stuck?: HTerm) {
+    super(why);
+  }
+}
 
-function oos(why: string): never {
-  throw new Scope_Error(why);
+function oos(why: string, stuck?: HTerm): never {
+  throw new Scope_Error(why, stuck);
 }
 
 // Book
@@ -151,11 +157,11 @@ function safe_book(book: Book): { text: string; oos: Array<[Name, string]> } {
   const e: Safe = { book, mb: { ...book, tlds: Object.create(book.tlds) as Book["tlds"] }, out: [], names: new Map(), seen: new Set(),
     todo: [], taken: new Set(), fail: new Map(), spec: new Map(), groups: new Map(),
     inst: new Map(Object.entries(book.tmps).flatMap(([k, is]) => Object.entries(is).map(([key, n]): [Name, [Name, HTerm[]]] =>
-      [n, [k, key.split("\n").map((a) => B.term_higher(JSON.parse(a) as B.LTerm))]]))) };
+      [n, [k, key.split("\n").map((a) => B.term_higher(JSON.parse(a) as B.LTerm))]]))), up: new Map() };
   const roots: Array<[Name, string]> = [];
   for (const k of [...book.order].filter((k, i) => book.order.lastIndexOf(k) === i && book.tlds[k].b !== true)) {
     try {
-      roots.push(...root_cols(e, k, book.tlds[k].T, 0).map((cols): [Name, string] => [k, item_try(e, k, cols)]));
+      roots.push(...root_cols(e, k, book.tlds[k].T, 0).flatMap((cols) => root_at(e, k, cols)));
     } catch (x) {
       if (!(x instanceof Scope_Error)) {
         throw x;
@@ -186,10 +192,10 @@ function safe_book(book: Book): { text: string; oos: Array<[Name, string]> } {
 }
 
 // the columns root k checks at, from its telescope T's parameter j on:
-// a specialized parameter of a finite type (Quant, or a datatype whose
-// constructors have no fields) at each value, any other at an opaque
+// a specialized Quant parameter at each value, any other at an opaque
 // constant k~p of its type, which models read at its model (as bend2
-// checks a template: its body holds at every argument)
+// checks a template: its body holds at every argument), split where the
+// root needs its constructor (root_at)
 function root_cols(e: Safe, k: Name, T: HTerm, j: number): Cols[] {
   const sp = spec_of(e, k);
   const F = B.term_wnf(e.book, T);
@@ -200,27 +206,84 @@ function root_cols(e: Safe, k: Name, T: HTerm, j: number): Cols[] {
   if (!sp[j]) {
     return at(null);
   }
-  const A = B.term_wnf(e.book, F.A);
-  const adt = A.$ === "ADT" && A.x.length === 0 ? e.book.tlds[A.k] as ADT : null;
-  const vs = A.$ === "Qnt" ? [B.None(), B.Lone(), B.Many()].map((q) => B.Qua(q))
-    : adt !== null && adt.c.every((c) => B.term_wnf(e.book, c.T).$ !== "All") ? adt.c.map((c) => B.Ctr(c.k, [])) : null;
-  if (vs !== null) {
-    return vs.flatMap(at);
+  if (is_qnt(e, F.A)) {
+    return [B.None(), B.Lone(), B.Many()].flatMap((q) => at(B.Qua(q)));
   }
   if (mentions(B.term_lower(F.A, j), (i) => i >= 0 && i < j)) {
     oos("a specialized parameter whose type names a parameter");
   }
-  let c = k + "~" + F.k;
+  return at(konst(e, k + "~" + F.k, F.A));
+}
+
+// an opaque root constant n of type T, split from the datatypes up
+function konst(e: Safe, n: string, T: HTerm, up: Name[] = []): HTerm {
+  let c = n;
   while (e.book.tlds[c] !== undefined) {
     c += "~";
   }
-  const def: Def = { $: "Def", n: 0, x: 0, T: F.A, v: null };
+  const def: Def = { $: "Def", n: 0, x: 0, T, v: null };
   e.book.tlds[c] = def;
-  const m = model(e, F.A);
+  const m = model(e, T);
   if (m !== null) {
     e.mb.tlds[c] = { ...def, v: m };
   }
-  return at(B.Ref(c));
+  e.up.set(c, up);
+  return B.Ref(c);
+}
+
+// root k at cols, and its name; stuck on one of its constants (a kind
+// that is no literal, or a match that needs a constructor), it goes at
+// each constructor of it, if one reduces the stuck term, now or once its
+// fields split so
+function root_at(e: Safe, k: Name, cols: Cols): Array<[Name, string]> {
+  try {
+    return [[k, item_ref(e, k, cols, true)]];
+  } catch (x) {
+    if (!(x instanceof Scope_Error)) {
+      throw x;
+    }
+    const t = x.stuck;
+    const key = (u: HTerm): string => B.term_key(B.term_lower(u));
+    const opens = (u: HTerm, v: HTerm): boolean => key(B.term_snf(e.book, u)) !== key(u)
+      || consts(e, v).some((c) => ctors(e, c)?.some((w) => opens(sub(u, c, w), w)));
+    for (const c of t === undefined ? [] : consts(e, t)) {
+      const vs = ctors(e, c);
+      if (vs !== null && (t?.$ === "Ref" || vs.some((v) => opens(sub(t as HTerm, c, v), v)))) {
+        return vs.flatMap((v) => root_at(e, k, cols.map((u) => u && sub(u, c, v))));
+      }
+    }
+    return [[k, e.names.get(item_key(k, cols)) as string]];
+  }
+}
+
+// the root constants in t
+function consts(e: Safe, t: HTerm): Name[] {
+  const cs: Name[] = [];
+  subst(t, 0, (o) => void (o.$ === "Ref" && e.up.has(o.k as Name) && cs.push(o.k as Name)));
+  return cs;
+}
+
+// constant c at each constructor of its datatype, its fields fresh
+// constants; none when c was split from that datatype (a kind that reads
+// a value through a recursive type is out of scope)
+function ctors(e: Safe, c: Name): HTerm[] | null {
+  const up = e.up.get(c) as Name[];
+  const A = B.term_wnf(e.book, e.book.tlds[c].T);
+  if (A.$ !== "ADT" || up.includes(A.k)) {
+    return null;
+  }
+  return (e.book.tlds[A.k] as ADT).c.filter((d) => !A.r.includes(d.k)).map((d) => {
+    const xs: HTerm[] = [];
+    for (let U = B.term_wnf(e.book, B.tele_fill(e.book, d.T, A.x, B.ctx_nil())); U.$ === "All"; U = B.term_wnf(e.book, U.B(xs[xs.length - 1]))) {
+      xs.push(konst(e, c + "." + U.k, U.A, [...up, A.k]));
+    }
+    return B.term_snf(e.book, B.Ctr(d.k, xs));
+  });
+}
+
+// u with constant c replaced by v
+function sub(u: HTerm, c: Name, v: HTerm): HTerm {
+  return subst(u, 0, (o) => o.$ === "Ref" && o.k === c ? v : undefined);
 }
 
 // item_ref, with a failure kept as the item's reason
@@ -503,7 +566,7 @@ function is_qnt(e: Safe, T: HTerm): boolean {
 // a Quant term's literal
 function quant_eval(e: Safe, s: Scope, t: HTerm): Q {
   const x = spec_val(e, s, t);
-  return x.$ === "Qua" ? quant(x.q) : oos("a Quant that is not a literal");
+  return x.$ === "Qua" ? quant(x.q) : oos("a Quant that is not a literal", x);
 }
 
 // Scope
@@ -744,7 +807,7 @@ function pick(e: Safe, t: HTerm, v: HTerm): [HTerm, HTerm[]] {
     [m] = open(m.m);
   }
   if (c.$ !== "Ctr" || m.$ === "Efq") {
-    return oos("a specialized argument that is not a constructor");
+    return oos("a specialized argument that is not a constructor", w);
   }
   return m.$ === "Mat" ? [m.h, c.x] : [m, [c]];
 }
