@@ -137,9 +137,9 @@ type Safe = {
   uses: WeakMap<O, Map<number, number>>;
 };
 
-// a model search's fuel left, its round's depth, and whether that round
-// cut a branch at the depth or the fuel
-type Probe = { left: number; depth: number; cut: boolean };
+// a model search's fuel left, its round's depth, whether that round cut
+// a branch at the depth or the fuel, and whether a λ may match (refit's)
+type Probe = { left: number; depth: number; cut: boolean; mat: boolean };
 
 // Constants
 // =========
@@ -152,6 +152,9 @@ const NAT_MAX = 4096;
 // MODEL_DEPTH
 const MODEL_FUEL = 1 << 22;
 const MODEL_DEPTH = 8;
+
+// the models refit tries per ~ constant and projection
+const MODELS = 8;
 
 // only this compiler release may build a cached kernel
 const LEAN_VERSION = "4.34.0";
@@ -242,14 +245,17 @@ function safe_pass(book: Book, groups: Map<Name, Group>, inst: Safe["inst"]): { 
 // a specialized parameter of a finite type (Quant, or a datatype whose
 // constructors have no fields) at each value, any other at an opaque
 // constant of its type, one per place for all roots, which models read at
-// its model (as bend2 checks a template: its body holds at every argument)
-function root_cols(e: Safe, k: Name, T: HTerm, j: number): Cols[] {
+// its model (as bend2 checks a template: its body holds at every argument);
+// cs are this root's new constants so far, whose models a law of them may
+// need refit (a kept one's model holds for the roots before)
+function root_cols(e: Safe, k: Name, T: HTerm, j: number, cs: Name[] = []): Cols[] {
   const tld = e.book.tlds[k];
   const F = j === tld.n ? null : B.term_wnf(e.book, T);
   if (F?.$ !== "All") {
     return [[]];
   }
-  const at = (v: HTerm | null): Cols[] => root_cols(e, k, F.B(v ?? B.Var(F.k, j)), j + 1).map((cs) => [v, ...cs]);
+  const at = (v: HTerm | null, c?: Name): Cols[] =>
+    root_cols(e, k, F.B(v ?? B.Var(F.k, j)), j + 1, c === undefined ? cs : [...cs, c]).map((vs) => [v, ...vs]);
   if (tld.$ !== "Def" || j >= tld.x) {
     return at(null);
   }
@@ -277,9 +283,11 @@ function root_cols(e: Safe, k: Name, T: HTerm, j: number): Cols[] {
   const m = model(e, F.A);
   if (m !== null) {
     e.mb.tlds[c] = { ...def, v: m };
+  } else {
+    refit(e, [...cs, c]);
   }
   e.consts.set(key, c);
-  return at(B.Ref(c));
+  return at(B.Ref(c), c);
 }
 
 // item_ref, with a failure kept as the item's reason
@@ -370,7 +378,8 @@ function item_emit(e: Safe, k: Name, cols: Cols, n: string): void {
 // no body goes out opaque, at a model of its type
 function def_emit(e: Safe, k: Name, cols: Cols, n: string, tld: Def): void {
   const T = B.tele_fill(e.book, tld.T, cols.slice(0, tld.x) as HTerm[], B.ctx_nil());
-  const t = tld.e !== undefined ? null : model(e, T) ?? oos("no model for " + (tld.i === undefined ? "" : (tld.b === true ? "base's" : "the") + " foreign def ") + B.name_key(k));
+  const m = Object.hasOwn(e.mb.tlds, k) ? (e.mb.tlds[k] as Def).v : null;
+  const t = tld.e !== undefined ? null : m ?? model(e, T) ?? oos("no model for " + (tld.i === undefined ? "" : (tld.b === true ? "base's" : "the") + " foreign def ") + B.name_key(k));
   const s = { ...scope_nil(), self: n };
   const To = term(e, s, T, false);
   e.out.push([n, To, t === null ? arm(e, s, k, cols, []) : tree(e, s, t, []), t !== null]);
@@ -452,14 +461,17 @@ function subst(t: HTerm, d: number, f: (o: Record<string, unknown>) => HTerm | u
 
 // Model
 // -----
-// a model of type T: λs around a model of the codomain, a datatype's
-// first constructor whose fields all have one (none for a datatype
-// already on the path), Unit for a kind, {==} for an equation bend2
-// converts, else a live λ variable of type T (the codomain's own, so it
-// is used once); none for an empty type. A projection model takes that
-// variable first: a law like {a == sub(add(a, b), b)} holds of it, one
-// like {add(a, b) == add(b, a)} of a constant. It reads the model book,
-// as the kernel checks a model with every opaque def at its own
+// the models of type T, best first: λs around a model of the codomain,
+// a datatype's constructors whose fields all have one (none for a
+// datatype already on the path), Unit for a kind, {==} for an equation
+// bend2 converts, else a live λ variable of type T (the codomain's own,
+// so it is used once); none for an empty type. In refit, a live λ over a
+// datatype whose constructors have no fields, with no model under a
+// variable, is a match, whose arms read the constructor: {x == y : A} at
+// A = Unit. A projection model takes that variable first: a law like
+// {a == sub(add(a, b), b)} holds of it, one like {add(a, b) == add(b, a)}
+// of a constant. It reads the model book, as the kernel checks a model
+// with every opaque def at its own
 
 function model(e: Safe, T: HTerm): HTerm | null {
   return model_by(e, T, false) ?? model_by(e, T, true);
@@ -469,14 +481,59 @@ function model(e: Safe, T: HTerm): HTerm | null {
 // that does is retried deeper while fuel lasts, and the first model a
 // cut round found stands only when none is left (the kernel checks it)
 function model_by(e: Safe, T: HTerm, proj: boolean): HTerm | null {
-  const probe: Probe = { left: MODEL_FUEL, depth: MODEL_DEPTH, cut: true };
+  const probe: Probe = { left: MODEL_FUEL, depth: MODEL_DEPTH, cut: true, mat: false };
   let m: HTerm | null = null;
   for (; probe.cut && probe.left > 0; probe.depth *= 2) {
     probe.cut = false;
-    const v = model_at(e, T, 0, [], [], proj, probe);
+    const v = first(model_at(e, T, 0, [], [], proj, probe));
     m = probe.cut ? m ?? v : v;
   }
   return m;
+}
+
+function first(ms: Generator<HTerm>): HTerm | null {
+  const m = ms.next();
+  return m.done === true ? null : m.value;
+}
+
+// models of the constants cs that hold together, up to MODELS of each, in
+// model_by's rounds on one fuel: the first model of le is λx y. False{},
+// and a law {le(x, y) == True{}} has none at it. With none found, each
+// keeps what it had, and the last goes without, out of scope
+function refit(e: Safe, cs: Name[]): void {
+  const probe: Probe = { left: MODEL_FUEL, depth: MODEL_DEPTH, cut: true, mat: true };
+  for (; probe.cut && probe.left > 0; probe.depth *= 2) {
+    probe.cut = false;
+    if (refit_at(e, cs, 0, probe)) {
+      return;
+    }
+  }
+}
+
+function refit_at(e: Safe, cs: Name[], i: number, probe: Probe): boolean {
+  if (i === cs.length) {
+    return true;
+  }
+  const def = e.book.tlds[cs[i]] as Def;
+  const had = Object.hasOwn(e.mb.tlds, cs[i]) ? e.mb.tlds[cs[i]] : null;
+  for (const proj of [false, true]) {
+    let n = 0;
+    for (const v of model_at(e, def.T, 0, [], [], proj, probe)) {
+      e.mb.tlds[cs[i]] = { ...def, v };
+      if (refit_at(e, cs, i + 1, probe)) {
+        return true;
+      }
+      if (++n === MODELS) {
+        break;
+      }
+    }
+  }
+  if (had === null) {
+    delete e.mb.tlds[cs[i]];
+  } else {
+    e.mb.tlds[cs[i]] = had;
+  }
+  return false;
 }
 
 // a datatype's key on the path: binders inside it count from d, so a
@@ -486,10 +543,10 @@ function model_key(F: HTerm, d: number): string {
   return JSON.stringify(B.term_lower(F, d), (k, v) => k === "s" ? undefined : k !== "i" ? v : Array.isArray(v) ? v.map(at) : at(v));
 }
 
-function model_at(e: Safe, T: HTerm, d: number, path: string[], hs: Array<[HTerm, HTerm]>, proj: boolean, probe: Probe): HTerm | null {
+function* model_at(e: Safe, T: HTerm, d: number, path: string[], hs: Array<[HTerm, HTerm]>, proj: boolean, probe: Probe): Generator<HTerm> {
   if (path.length + d > probe.depth || probe.left <= 0) {
     probe.cut = true;
-    return null;
+    return;
   }
   probe.left -= 1;
   const F = B.term_wnf(e.mb, T);
@@ -497,43 +554,69 @@ function model_at(e: Safe, T: HTerm, d: number, path: string[], hs: Array<[HTerm
   switch (F.$) {
     case "Typ": {
       const tld = e.mb.tlds["Unit"];
-      return tld?.$ === "ADT" && tld.n === 0 ? B.ADT("Unit", []) : null;
+      if (tld?.$ === "ADT" && tld.n === 0) {
+        yield B.ADT("Unit", []);
+      }
+      return;
     }
     case "All": {
-      // the body is searched once, then each use binds level d in it
+      // the body is searched once per model, then each use binds level d in it
       const x: HTerm = B.Var(F.k, d);
-      const t = model_at(e, F.B(x), d + 1, path, F.q.$ === "None" ? hs : [...hs, [x, F.A]], proj, probe);
-      return t === null ? null : B.Ann(B.Lam(F.k, d, (v: HTerm) =>
-        subst(t, d + 1, (o) => o.$ !== "Var" || (o.i as number) > d ? undefined : o.i === d ? v : B.Var(o.k as Name, o.i as number))), F);
+      let n = 0;
+      for (const t of model_at(e, F.B(x), d + 1, path, F.q.$ === "None" ? hs : [...hs, [x, F.A]], proj, probe)) {
+        n += 1;
+        yield B.Ann(B.Lam(F.k, d, (v: HTerm) =>
+          subst(t, d + 1, (o) => o.$ !== "Var" || (o.i as number) > d ? undefined : o.i === d ? v : B.Var(o.k as Name, o.i as number))), F);
+      }
+      const A = B.term_wnf(e.mb, F.A);
+      const D = A.$ === "ADT" && A.r.length === 0 ? e.mb.tlds[A.k] : undefined;
+      const cs = n > 0 || !probe.mat || F.q.$ === "None" || D?.$ !== "ADT" ? [] : D.c;
+      const ms = cs.map((c) => B.term_wnf(e.mb, B.tele_fill(e.mb, c.T, (A as { x: HTerm[] }).x, B.ctx_nil())).$ === "All" ? null
+        : first(model_at(e, F.B(B.Ann(B.Ctr(c.k, []), A)), d, path, hs, proj, probe)));
+      if (ms.length > 0 && !ms.includes(null)) {
+        yield B.Ann(cs.reduceRight<HTerm>((m, c, j) => B.Mat(c.k, ms[j] as HTerm, m), B.Efq()), F);
+      }
+      return;
     }
     case "ADT": {
       const key = model_key(F, d);
       probe.left -= key.length;
       const tld = e.mb.tlds[F.k];
       if (tld?.$ !== "ADT") {
-        return hyp();
+        yield* hyp_of(hyp());
+        return;
       }
       const h = proj ? hyp() : null;
       for (const c of path.includes(key) || h !== null ? [] : tld.c.filter((c) => !F.r.includes(c.k))) {
         const xs: HTerm[] = [];
         let U = B.term_wnf(e.mb, B.tele_fill(e.mb, c.T, F.x, B.ctx_nil()));
         let x: HTerm | null = null;
-        while (U.$ === "All" && (x = model_at(e, U.A, d, [...path, key], [], proj, probe)) !== null) {
+        while (U.$ === "All" && (x = first(model_at(e, U.A, d, [...path, key], [], proj, probe))) !== null) {
           xs.push(x);
           U = B.term_wnf(e.mb, U.B(x));
         }
         if (U.$ !== "All") {
-          return B.Ann(B.Ctr(c.k, xs), F);
+          yield B.Ann(B.Ctr(c.k, xs), F);
         }
       }
-      return hyp();
+      yield* hyp_of(hyp());
+      return;
     }
     case "Eql": {
-      return B.term_compare("EQ", e.mb, F.a, F.b, d) ? B.Ann(B.Rfl(), F) : null;
+      if (B.term_compare("EQ", e.mb, F.a, F.b, d)) {
+        yield B.Ann(B.Rfl(), F);
+      }
+      return;
     }
     default: {
-      return hyp();
+      yield* hyp_of(hyp());
     }
+  }
+}
+
+function* hyp_of(x: HTerm | null): Generator<HTerm> {
+  if (x !== null) {
+    yield x;
   }
 }
 
